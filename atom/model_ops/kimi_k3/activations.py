@@ -15,6 +15,8 @@ try:
     import triton
     import triton.language as tl
 
+    from atom.model_ops.triton_e8m0_quant import fp8_e8m0_group_scale
+
     _HAS_TRITON = True
 except ImportError:  # pragma: no cover
     _HAS_TRITON = False
@@ -71,6 +73,11 @@ if _HAS_TRITON:
         stride_g_head,
         HEADS: tl.constexpr,
         BLOCK: tl.constexpr,
+        s_ptr=None,
+        stride_s_outer=0,
+        stride_s_head=0,
+        E8M0_SCALE: tl.constexpr = False,
+        FP8_MAX: tl.constexpr = 0.0,
     ):
         row = tl.program_id(0)
         row_i64 = row.to(tl.int64)
@@ -91,6 +98,15 @@ if _HAS_TRITON:
         w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         gate = tl.load(g_ptr + g_off, mask=mask, other=0.0).to(tl.float32)
         y = (x * rstd * w) * tl.sigmoid(gate)
+        if E8M0_SCALE:  # one row = one (token, head) = one 128-wide group
+            y = y.to(x_ptr.dtype.element_ty).to(tl.float32)
+            code, multiplier = fp8_e8m0_group_scale(tl.max(tl.abs(y), axis=0), FP8_MAX)
+            y = tl.clamp(
+                y * multiplier, -FP8_MAX, FP8_MAX, propagate_nan=tl.PropagateNan.ALL
+            )
+            tl.store(
+                s_ptr + outer_i64 * stride_s_outer + head_i64 * stride_s_head, code
+            )
         tl.store(
             y_ptr + row_i64 * stride_ym + cols,
             y.to(y_ptr.dtype.element_ty),
@@ -310,6 +326,7 @@ def rmsnorm_gated(
     quant_type: QuantType | None = None,
     quant_dtype: torch.dtype | None = None,
     is_prefill: bool = False,
+    e8m0_scale: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """rmsnorm(x) over last dim * weight * sigmoid(gate).
 
@@ -317,8 +334,10 @@ def rmsnorm_gated(
     output is also quantized and the function returns
     ``(fp8 [t, heads*H], scale [t, 1])`` ready for the consuming GEMM's
     ``x_scale=`` path. With no quant (``None``/``QuantType.No``) it returns the
-    bf16 tensor shaped like ``x``. Per-token FP8 is the only fused scheme today
-    (the consuming o_proj's a8w8 scheme); any other requested scheme asserts.
+    bf16 tensor shaped like ``x``. Per-token FP8 is the only fused scheme
+    besides ``e8m0_scale`` (per-1x128 FP8, one group per 128-wide head:
+    ``(fp8 [t, heads*H], E8M0 scale [t, heads])``, bit-identical to
+    ``per_1x128_e8m0_quant`` of the bf16 output); any other scheme asserts.
 
     ``gate`` may be strided (e.g. a column slice of a fused GEMM output): the
     kernel reads it via (outer, head) strides so no contiguous copy is needed.
@@ -327,17 +346,42 @@ def rmsnorm_gated(
     """
     if quant_type == QuantType.per_Token and quant_dtype == dtypes.fp8:
         return _rmsnorm_gated_per_token_quant(x, weight, gate, eps, quant_dtype)
+    e8m0 = (
+        quant_type == QuantType.per_1x128 and quant_dtype == dtypes.fp8 and e8m0_scale
+    )
     # Only the no-quant (bf16) path remains. Any other requested scheme is
     # unsupported here -- fail loud rather than silently feed bf16 activations to
     # a GEMM that expects quantized input.
-    assert quant_type in (None, QuantType.No), (
-        "rmsnorm_gated only fuses per-token FP8 quant; got "
+    assert e8m0 or quant_type in (None, QuantType.No), (
+        "rmsnorm_gated fuses per-token or E8M0 per-1x128 FP8 quant; got "
         f"quant_type={quant_type}, quant_dtype={quant_dtype}"
     )
     h = x.shape[-1]
     x2 = x.reshape(-1, h)
     m = x2.shape[0]
-    if not _HAS_TRITON or m == 0 or h > 8192:
+    # BF16 prefill keeps the same per-head reduction layout at every batch
+    # size. Switching between the one-row and multirow layouts changes FP32
+    # variance reduction and sqrt rounding; a BF16 midpoint can then change
+    # downstream expert selection after a prefix is resumed in a smaller batch.
+    # Reuse the existing eight-row kernel, including for short prefills.
+    # Other dtypes retain the measured flattened-row (tokens * heads) cutoffs.
+    stable_bf16 = x.dtype == torch.bfloat16
+    multirow = (
+        is_prefill and h == 128 and (stable_bf16 or m >= _RMSNORM_MULTIROW_MIN_ROWS)
+    )
+    if e8m0:
+        assert x.ndim == 3 and gate.ndim == 3 and h == 128, (x.shape, gate.shape)
+        from atom.utils import envs
+
+        col_major = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        if multirow:
+            # Prefill quantizes separately: fused in, the multirow kernel compiles
+            # to a norm that differs in the last bf16 bit on rare elements.
+            from atom.model_ops.linear import per_1x128_e8m0_quant
+
+            y = rmsnorm_gated(x, weight, gate, eps, is_prefill=True)
+            return per_1x128_e8m0_quant(y.view(x.shape[0], -1), quant_dtype, col_major)
+    elif not _HAS_TRITON or m == 0 or h > 8192:
         return _rmsnorm_gated_torch(x, weight, gate, eps)
     if gate.ndim == 3:
         heads = gate.shape[1]
@@ -348,15 +392,25 @@ def rmsnorm_gated(
         stride_g_outer, stride_g_head = gate.stride(0), 0
     x2 = x2.contiguous()
     y = torch.empty_like(x2)
+    e8m0_args = {}
+    if e8m0:
+        t = x.shape[0]
+        y = torch.empty((m, h), dtype=quant_dtype, device=x.device)
+        # uint8, viewed as E8M0 below; preshuffle: column-major, as aiter's
+        scale = torch.empty(
+            (heads, t) if col_major else (t, heads), dtype=torch.uint8, device=x.device
+        )
+        e8m0_args = {
+            "s_ptr": scale,
+            "stride_s_outer": 1 if col_major else heads,
+            "stride_s_head": t if col_major else 1,
+            "E8M0_SCALE": True,
+            "FP8_MAX": float(torch.finfo(quant_dtype).max),
+        }
+        if m == 0:
+            return y.view(t, heads * h), scale.view(t, heads).view(dtypes.fp8_e8m0)
     BLOCK = triton.next_power_of_2(h)
-    # BF16 prefill keeps the same per-head reduction layout at every batch
-    # size. Switching between the one-row and multirow layouts changes FP32
-    # variance reduction and sqrt rounding; a BF16 midpoint can then change
-    # downstream expert selection after a prefix is resumed in a smaller batch.
-    # Reuse the existing eight-row kernel, including for short prefills.
-    # Other dtypes retain the measured flattened-row (tokens * heads) cutoffs.
-    stable_bf16 = x.dtype == torch.bfloat16
-    if is_prefill and h == 128 and (stable_bf16 or m >= _RMSNORM_MULTIROW_MIN_ROWS):
+    if multirow:
         is_long = not stable_bf16 and m >= _RMSNORM_MULTIROW_LONG_ROWS
         block_m = (
             _RMSNORM_MULTIROW_LONG_BLOCK_M if is_long else _RMSNORM_MULTIROW_BLOCK_M
@@ -379,21 +433,24 @@ def rmsnorm_gated(
             num_warps=2 if is_long else 1,
             waves_per_eu=4,
         )
-        return y.reshape_as(x)
-    _rmsnorm_gated_kernel[(m,)](
-        x2,
-        weight,
-        gate,
-        y,
-        h,
-        float(eps),
-        x2.stride(0),
-        y.stride(0),
-        stride_g_outer,
-        stride_g_head,
-        HEADS=heads,
-        BLOCK=BLOCK,
-    )
+    else:
+        _rmsnorm_gated_kernel[(m,)](
+            x2,
+            weight,
+            gate,
+            y,
+            h,
+            float(eps),
+            x2.stride(0),
+            y.stride(0),
+            stride_g_outer,
+            stride_g_head,
+            HEADS=heads,
+            BLOCK=BLOCK,
+            **e8m0_args,
+        )
+    if e8m0:
+        return y.view(t, heads * h), scale.view(t, heads).view(dtypes.fp8_e8m0)
     return y.reshape_as(x)
 
 
