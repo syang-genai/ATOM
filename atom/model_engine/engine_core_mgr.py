@@ -333,6 +333,7 @@ class CoreManager:
             self._prefix_router = PrefixSpreadRouter(
                 envs.ATOM_DP_PREFIX_IDLE_TOKENS,
                 KVConnectorFactory.offload_tier(config),
+                config.max_num_seqs,
             )
             self._dp_route_counters.update(
                 dict.fromkeys(
@@ -804,7 +805,8 @@ class CoreManager:
                             # sequence's prompt prefill has completed. Keep the
                             # request count charged for decode pressure, but
                             # stop advertising its prompt as queued prefill.
-                            self._mark_seq_prefill_complete(seq_id)
+                            if self._completes_prefill(request_output):
+                                self._mark_seq_prefill_complete(seq_id)
                             callback = self._seq_id_to_callback.get(seq_id)
                             if dbg:
                                 logger.debug(
@@ -1534,7 +1536,11 @@ class CoreManager:
         """Prefix-spread placement (`PrefixSpreadRouter.select`); a new prefix
         goes where `least_tokens` would put it."""
         route = self._prefix_router.select(
-            seq, self._rank_tokens, self._rank_load, self._select_dp_rank_locked
+            seq,
+            self._rank_tokens,
+            self._rank_reqs,
+            self._rank_load,
+            self._select_dp_rank_locked,
         )
         if route.decision == "prefix_moved_total":
             self._dp_route_counters["prefix_moved_tokens"] += route.moved_tokens
@@ -1645,6 +1651,13 @@ class CoreManager:
         dp_rank, req_cost, tok_cost = entry
         self._rank_reqs[dp_rank] -= req_cost
         self._rank_tokens[dp_rank] -= tok_cost
+
+    @staticmethod
+    def _completes_prefill(request_output) -> bool:
+        """Whether a STREAM output shows its request's prefill completed. A
+        finished output with no tokens does not (a structured-output error
+        mid-prefill, say): its release takes the unprefilled path."""
+        return not request_output.finished or bool(request_output.output_tokens)
 
     def _mark_seq_prefill_complete(self, seq_id) -> None:
         """Release only a sequence's prefill-token charge, once."""
